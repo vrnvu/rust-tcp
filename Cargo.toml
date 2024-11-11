@@ -1,0 +1,9 @@
+[package]
+name = "rust-tcp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.93"
+mio = { version = "1.0.2", features = ["os-poll", "net"] }
+slab = "0.4.9"

@@ -1,13 +1,15 @@
-use std::{
-    env,
-    io::{self, Read, Write},
-    net::SocketAddr,
-};
+use std::{env, net::SocketAddr};
 
 use anyhow::{Context, Result};
 use log::{debug, error, info};
-use mio::{net::TcpListener, Events, Poll, Token};
+use mio::{
+    net::{TcpListener, TcpStream},
+    Events, Poll, Token,
+};
 use slab::Slab;
+
+mod connection;
+use connection::Connection;
 
 const MAX_CLIENTS: usize = 1024;
 const LISTENER: Token = Token(MAX_CLIENTS + 1);
@@ -17,7 +19,7 @@ struct Server {
     listener: TcpListener,
     poll: Poll,
     events: Events,
-    connections: Slab<Connection>,
+    connections: Slab<Connection<TcpStream>>,
 }
 
 impl Server {
@@ -25,7 +27,7 @@ impl Server {
         addr: SocketAddr,
         poll: Poll,
         events: Events,
-        connections: Slab<Connection>,
+        connections: Slab<Connection<TcpStream>>,
     ) -> Result<Self> {
         let mut listener = TcpListener::bind(addr)?;
 
@@ -33,7 +35,7 @@ impl Server {
             .register(&mut listener, LISTENER, mio::Interest::READABLE)
             .with_context(|| "Failed to register listener")?;
 
-        info!("server listening on {:?}", addr);
+        info!("server listening on {:?}", listener.local_addr()?);
         Ok(Self {
             listener,
             poll,
@@ -78,55 +80,68 @@ impl Server {
                             if event.is_readable() {
                                 match connection.read() {
                                     Ok(0) => {
-                                        self.poll
-                                            .registry()
-                                            .deregister(&mut connection.socket)
-                                            .with_context(|| "Failed to deregister socket")?;
-                                        self.connections.try_remove(token.0);
+                                        debug!("Client disconnected");
+                                        while let Err(e) =
+                                            self.poll.registry().deregister(&mut connection.socket)
+                                        {
+                                            error!("server: Failed to deregister socket: {:?}", e);
+                                        }
+                                        self.connections.remove(token.0);
+                                        continue;
                                     }
                                     Ok(_) => {
-                                        if let Err(e) = connection.write() {
-                                            if e.kind() == std::io::ErrorKind::WouldBlock {
-                                                self.poll
-                                                    .registry()
-                                                    .reregister(
-                                                        &mut connection.socket,
-                                                        token,
-                                                        mio::Interest::READABLE
-                                                            .add(mio::Interest::WRITABLE),
-                                                    )
-                                                    .with_context(|| {
-                                                        "readable branch: Failed to reregister socket as READABLE and WRITABLE"
-                                                    })?;
-                                                continue;
-                                            }
-                                            error!("readable branch: Failed to write: {:?}", e);
-                                            return Err(e.into());
-                                        }
+                                        self.poll
+                                            .registry()
+                                            .reregister(
+                                                &mut connection.socket,
+                                                token,
+                                                mio::Interest::READABLE
+                                                    .add(mio::Interest::WRITABLE),
+                                            )
+                                            .with_context(|| "Failed to reregister socket")?;
+                                        continue;
                                     }
-                                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                                         continue;
                                     }
                                     Err(e) => {
-                                        error!("readable branch: Failed to read: {:?}", e);
-                                        return Err(e.into());
+                                        error!("server: Failed to read: {:?}", e);
+                                        let _ =
+                                            self.poll.registry().deregister(&mut connection.socket);
+                                        self.connections.remove(token.0);
+                                        continue;
                                     }
                                 }
                             } else if event.is_writable() {
-                                if let Err(e) = connection.write() {
-                                    if e.kind() == std::io::ErrorKind::WouldBlock {
-                                        self.poll.registry().reregister(
-                                            &mut connection.socket,
-                                            token,
-                                            mio::Interest::READABLE.add(mio::Interest::WRITABLE),
-                                        )
-                                        .with_context(|| {
-                                            "writeable branch: Failed to reregister socket as READABLE and WRITABLE"
-                                        })?;
+                                match connection.write() {
+                                    Ok(_) => {
+                                        self.poll
+                                            .registry()
+                                            .reregister(
+                                                &mut connection.socket,
+                                                token,
+                                                mio::Interest::READABLE,
+                                            )
+                                            .with_context(|| {
+                                                "Failed to reregister socket as READABLE"
+                                            })?;
+                                    }
+                                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                                         continue;
-                                    } else {
+                                    }
+                                    Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                                        debug!("Client disconnected (broken pipe)");
+                                        let _ =
+                                            self.poll.registry().deregister(&mut connection.socket);
+                                        self.connections.remove(token.0);
+                                        continue;
+                                    }
+                                    Err(e) => {
                                         error!("writeable branch: Failed to write: {:?}", e);
-                                        return Err(e.into());
+                                        let _ =
+                                            self.poll.registry().deregister(&mut connection.socket);
+                                        self.connections.remove(token.0);
+                                        continue;
                                     }
                                 }
                             }
@@ -135,45 +150,6 @@ impl Server {
                 }
             }
         }
-    }
-}
-
-#[derive(Debug)]
-struct Connection {
-    socket: mio::net::TcpStream,
-    buf: Vec<u8>,
-    last_read_n: usize,
-}
-
-impl Connection {
-    fn with_capacity(socket: mio::net::TcpStream, capacity: usize) -> Self {
-        Self {
-            socket,
-            buf: vec![0; capacity],
-            last_read_n: 0,
-        }
-    }
-
-    fn read(&mut self) -> io::Result<usize> {
-        if self.last_read_n >= self.buf.len() {
-            return Ok(0);
-        }
-
-        let n = self.socket.read(&mut self.buf[self.last_read_n..])?;
-        self.last_read_n += n;
-        Ok(n)
-    }
-
-    fn write(&mut self) -> io::Result<()> {
-        let n = self.socket.write(&self.buf[..self.last_read_n])?;
-        if n > 0 {
-            if n < self.last_read_n {
-                self.buf.copy_within(n..self.last_read_n, 0);
-            }
-            self.last_read_n -= n;
-        }
-
-        Ok(())
     }
 }
 
@@ -196,41 +172,55 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use mio::net::TcpStream;
+
     use super::*;
-    use std::{net::TcpStream, thread, time::Duration};
+    use std::{
+        io::{Read, Write},
+        thread::{self},
+    };
 
-    #[test]
-    fn test_server_echo() -> Result<()> {
-        env_logger::init();
-
-        // Server setup
-        let server_addr = "127.0.0.1:0".parse::<SocketAddr>()?; // Use port 0 for automatic port assignment
+    fn setup_server() -> Result<(Server, SocketAddr)> {
+        let server_addr = "127.0.0.1:0".parse::<SocketAddr>()?;
         let poll = Poll::new()?;
         let events = Events::with_capacity(MAX_CLIENTS);
         let connections = Slab::with_capacity(MAX_CLIENTS);
-        let mut server = Server::bind(server_addr, poll, events, connections)?;
-        let actual_addr = server.listener.local_addr()?;
 
-        thread::spawn(move || {
-            server.run().unwrap();
-        });
+        let server = Server::bind(server_addr, poll, events, connections)?;
+        let local_addr = server.listener.local_addr()?;
+        Ok((server, local_addr))
+    }
 
-        thread::sleep(Duration::from_millis(100));
+    #[test]
+    fn test_single_message() -> Result<()> {
+        let (mut server, local_addr) = setup_server()?;
+        thread::spawn(move || server.run().unwrap());
 
-        // Test 1: Single message
-        let mut stream = TcpStream::connect(actual_addr)?;
+        let mut stream = TcpStream::connect(local_addr)
+            .with_context(|| format!("Failed to connect to {:?}", local_addr))?;
         stream.set_nodelay(true)?;
 
         let test_msg = b"Hello, Server!";
-        stream.write_all(test_msg)?;
+        stream
+            .write_all(test_msg)
+            .with_context(|| format!("Failed to write to {:?}", local_addr))?;
         stream.flush()?;
 
         let mut buf = vec![0; test_msg.len()];
-        stream.read_exact(&mut buf)?;
+        stream
+            .read_exact(&mut buf)
+            .with_context(|| format!("Failed to read from {:?}", local_addr))?;
         assert_eq!(&buf, test_msg);
 
-        // Test 2: Multiple writes before read
-        let mut stream = TcpStream::connect(actual_addr)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_multiple_writes() -> Result<()> {
+        let (mut server, local_addr) = setup_server()?;
+        thread::spawn(move || server.run().unwrap());
+
+        let mut stream = TcpStream::connect(local_addr)?;
         stream.set_nodelay(true)?;
 
         let test_msg1 = b"First";
@@ -244,8 +234,15 @@ mod tests {
         stream.read_exact(&mut buf)?;
         assert_eq!(buf, expected);
 
-        // Test 3: Large message
-        let mut stream = TcpStream::connect(actual_addr)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_large_message() -> Result<()> {
+        let (mut server, local_addr) = setup_server()?;
+        thread::spawn(move || server.run().unwrap());
+
+        let mut stream = TcpStream::connect(local_addr)?;
         stream.set_nodelay(true)?;
 
         let test_msg = vec![b'X'; 1024];
@@ -256,16 +253,23 @@ mod tests {
         stream.read_exact(&mut buf)?;
         assert_eq!(buf, test_msg);
 
-        // Test 4: Message larger than buffer
-        let mut stream = TcpStream::connect(actual_addr)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_message_larger_than_buffer() -> Result<()> {
+        let (mut server, local_addr) = setup_server()?;
+        thread::spawn(move || server.run().unwrap());
+
+        let mut stream = TcpStream::connect(local_addr)?;
         stream.set_nodelay(true)?;
 
-        let buffer_size = 1024; // Same as in Connection::with_capacity
-        let test_msg = vec![b'X'; buffer_size + 500]; // Exceeds buffer size
+        let buffer_size = 1024;
+        let test_msg = vec![b'X'; buffer_size + 500];
         stream.write_all(&test_msg)?;
         stream.flush()?;
 
-        let mut buf = vec![0; buffer_size]; // Should only receive buffer_size bytes
+        let mut buf = vec![0; buffer_size];
         stream.read_exact(&mut buf)?;
         assert_eq!(&buf[..], &test_msg[..buffer_size]);
 
